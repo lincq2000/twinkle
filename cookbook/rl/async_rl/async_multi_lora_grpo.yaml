@@ -108,6 +108,8 @@ lora_contexts:
       mini_batch_size: 4
       micro_batch_size: 1
       dynamic_batching: false
+      # Reorder each mini-batch so every model DP rank gets a similar token workload.
+      balance_batch: false
 
   - tenant_id: tenant_b
     training_run_id: gsm8k_async
@@ -134,3 +136,4 @@ lora_contexts:
       mini_batch_size: 4
       micro_batch_size: 1
       dynamic_batching: false
+      balance_batch: false

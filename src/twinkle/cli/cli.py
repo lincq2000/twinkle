@@ -102,6 +102,7 @@ class TrainingArgs:
     seed: int = field(default=42, metadata={'primary': True})
     full_determinism: bool = False
     padding_free: bool = False
+    balance_batch: bool = False
 
 
 @dataclass

@@ -402,6 +402,7 @@ def stateless_init_process_group(
     Returns:
         PyNcclCommunicator or PyHcclCommunicator instance.
     """
+    import dataclasses
     import torch
     from torch.distributed import TCPStore
     from vllm.distributed.utils import StatelessProcessGroup
@@ -433,23 +434,31 @@ def stateless_init_process_group(
     elif launch_server and listen_fd is None:
         listen_fd = listen_socket.fileno()
 
-    store = TCPStore(
+    store_kwargs = dict(
         host_name=master_address,
         port=master_port,
         world_size=world_size,
         is_master=launch_server,
         timeout=timedelta(seconds=300),
         use_libuv=False,  # for compatibility
-        master_listen_fd=listen_fd,
     )
-
-    pg = StatelessProcessGroup(
-        rank=rank,
-        world_size=world_size,
-        store=store,
-        socket=listen_socket,
-        data_expiration_seconds=3600,
-    )
+    group_kwargs = dict(rank=rank, world_size=world_size, data_expiration_seconds=3600)
+    if 'socket' in {field.name for field in dataclasses.fields(StatelessProcessGroup)}:
+        # Older vLLM: the group holds the listening socket, keeping its fd open for the store.
+        store = TCPStore(master_listen_fd=listen_fd, **store_kwargs)
+        pg = StatelessProcessGroup(store=store, socket=listen_socket, **group_kwargs)
+    else:
+        # Newer vLLM dropped that field, so the store takes over the fd. Left with the socket object,
+        # the fd is closed on garbage collection and the store's server thread aborts the process.
+        if listen_socket is not None:
+            listen_fd = listen_socket.detach()
+        try:
+            store = TCPStore(master_listen_fd=listen_fd, **store_kwargs)
+        except Exception:
+            if listen_socket is not None:
+                socket.close(listen_fd)
+            raise
+        pg = StatelessProcessGroup(store=store, **group_kwargs)
 
     communicator = Communicator(pg, device=device)
     return communicator

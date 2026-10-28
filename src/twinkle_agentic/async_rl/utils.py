@@ -20,6 +20,7 @@ class TrainBatchConfig:
     dynamic_batching: bool = False
     max_tokens_per_micro_batch: int | None = None
     packing_algorithm: Literal['ffd', 'kk'] = 'ffd'
+    balance_batch: bool = False
 
 
 def _extract_sampled_token_logps(logprobs: Any) -> list[float]:

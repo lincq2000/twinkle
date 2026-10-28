@@ -160,6 +160,58 @@ def test_train_batch_accumulates_real_micro_batches_before_one_optimizer_step():
     assert metrics['micro_batch_size_per_rank'] == 1
 
 
+@pytest.mark.parametrize('balance_batch', [False, True])
+def test_train_batch_balances_tokens_across_model_dp_ranks(balance_batch):
+    class Batch(dict):
+        batch_size = (4, )
+
+    class Model:
+        def __init__(self):
+            self.calls = []
+
+        def forward_backward(self, **kwargs):
+            self.calls.append(kwargs)
+
+        def clip_grad_and_step(self, **_kwargs):
+            return None
+
+        def calculate_metric(self, **_kwargs):
+            return {}
+
+    lengths = [8, 6, 2, 1]
+    context = _context()
+    admission = PartitionAdmission(context, context.partition_id(0), 0, 1, 4, 0)
+    data = Batch({
+        'input_ids': [list(range(length)) for length in lengths],
+        'labels': [list(range(length)) for length in lengths],
+        'attention_mask': [[1] * length for length in lengths],
+        'position_ids': [list(range(length)) for length in lengths],
+        'logprobs': [[float(length)] for length in lengths],
+        'advantages': [float(length) for length in lengths],
+        'rewards': [1., 1., 1., 1.],
+    })
+    model = Model()
+
+    metrics = _train_batch(
+        model,
+        {context.key: TrainBatchConfig(4, 1, balance_batch=balance_batch)},
+        data,
+        admission,
+        model_data_parallel_size=2,
+    )
+
+    call = model.calls[0]
+    sent_lengths = [len(model_input['input_ids']) for model_input in call['inputs']]
+    assert sent_lengths == ([8, 1, 6, 2] if balance_batch else lengths)
+    assert call['old_logps'] == [[float(length)] for length in sent_lengths]
+    assert call['advantages'] == [float(length) for length in sent_lengths]
+    if balance_batch:
+        assert metrics['dp_balance/rank_tokens_max_before'] == 14
+        assert metrics['dp_balance/rank_tokens_max_after'] == 9
+    else:
+        assert not any(key.startswith('dp_balance/') for key in metrics)
+
+
 def _context(name: str = 'adapter') -> LoraContext:
     return LoraContext('tenant', f'run_{name}', 'model', name)
 

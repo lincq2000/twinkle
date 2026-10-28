@@ -93,6 +93,16 @@ train.mini_batch_size % rollout.num_generations == 0
 train.mini_batch_size % model_dp == 0
 ```
 
+Set `train.balance_batch: true` to balance token workload across model DP
+ranks. Before each optimizer step, the Trainer reorders the mini-batch so the
+contiguous slice each rank receives has a similar token workload. Each rank
+still gets the same number of samples and the mini-batch keeps the same
+samples, so losses that average per sequence, such as the default `GRPOLoss`,
+produce the same update; only the slowest rank waits less. Losses that
+normalize by each rank's own token count can shift slightly.
+Training metrics gain `dp_balance/*` entries that compare per-rank token counts
+and the workload imbalance (max rank / mean) before and after reordering.
+
 ## Outputs
 
 | Output | Default path |

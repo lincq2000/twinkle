@@ -751,7 +751,9 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
                 unwrapped_model.disable_adapter()
                 if disable_lora and isinstance(unwrapped_model, PeftModel) else contextlib.nullcontext())
             with _resolve_task_context(self.model, task), lora_ctx, self._mm_forward_context(optimizer_config):
-                outputs = self.model(**inputs)
+                # In eval mode use_cache defaults to True, and Transformers skips detecting
+                # padding-free packed sequences whenever a KV cache exists.
+                outputs = self.model(**inputs, use_cache=False)
 
             recorded_routing = rr_cleanup()
 

@@ -5,6 +5,7 @@ from twinkle._lazy_module import _LazyModule
 
 if TYPE_CHECKING:
     from .base import TwinkleModel
+    from .dp_balance import DPBalancePlan, plan_dp_balance
     from .megatron import MegatronModel, MultiLoraMegatronModel
     from .micro_batch import MicroBatchConfig
     from .transformers import (MultiLoraTransformersModel, SpectralHybridTransformersModel, TransformersModel,
@@ -13,6 +14,7 @@ if TYPE_CHECKING:
 else:
     _import_structure = {
         'base': ['TwinkleModel'],
+        'dp_balance': ['DPBalancePlan', 'plan_dp_balance'],
         'micro_batch': ['MicroBatchConfig'],
         'transformers': [
             'TransformersModel', 'MultiLoraTransformersModel', 'SpectralHybridTransformersModel',

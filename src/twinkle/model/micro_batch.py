@@ -125,10 +125,18 @@ class _KKState:
         return self.spread > other.spread
 
 
-def _kk_partition(lengths: list[int], group_count: int) -> list[list[int]]:
+def _kk_partition(lengths: list[int], group_count: int, *, equal_size: bool = False) -> list[list[int]]:
+    ordered = sorted((value, index) for index, value in enumerate(lengths))
+    if equal_size:
+        if len(ordered) % group_count:
+            raise ValueError(f'equal-size KK needs len(lengths) % group_count == 0, got {len(ordered)} % {group_count}')
+        # Seeding each state with one item per group keeps every final group the same size.
+        seeds = [ordered[start:start + group_count] for start in range(0, len(ordered), group_count)]
+    else:
+        seeds = [[item] for item in ordered]
     queue = []
-    for value, index in sorted((value, index) for index, value in enumerate(lengths)):
-        heapq.heappush(queue, _KKState([(index, value)], group_count))
+    for seed in seeds:
+        heapq.heappush(queue, _KKState([(index, value) for value, index in seed], group_count))
     while len(queue) > 1:
         first = heapq.heappop(queue)
         second = heapq.heappop(queue)

@@ -212,6 +212,7 @@ class AsyncMultiLoraGRPOPipeline:
                 max_tokens_per_micro_batch=(int(train['max_tokens_per_micro_batch'])
                                             if train.get('max_tokens_per_micro_batch') is not None else None),
                 packing_algorithm=str(train.get('packing_algorithm', 'ffd')),
+                balance_batch=bool(train.get('balance_batch', False)),
             )
             validate_context_batch_config(
                 context.key,
@@ -650,6 +651,13 @@ def _train_batch_with_config(
     if size % model_data_parallel_size:
         raise ValueError(f'train batch size {size} must be divisible by model DP size '
                          f'{model_data_parallel_size}')
+    balance_metrics = {}
+    if config.balance_batch and model_data_parallel_size > 1:
+        from twinkle.model.dp_balance import plan_dp_balance
+
+        plan = plan_dp_balance(inputs, model_data_parallel_size)
+        inputs, old_logps, advantages = (plan.apply(values) for values in (inputs, old_logps, advantages))
+        balance_metrics = plan.metrics
     model.forward_backward(
         inputs=inputs,
         old_logps=old_logps,
@@ -668,6 +676,7 @@ def _train_batch_with_config(
     metrics['mini_batch_size'] = config.mini_batch_size
     metrics['micro_batch_size_per_rank'] = config.micro_batch_size
     metrics['dynamic_batching'] = config.dynamic_batching
+    metrics.update(balance_metrics)
     return metrics
 
 

@@ -70,6 +70,7 @@ class TestDefaults:
     def test_training_defaults(self):
         t = Args().training
         assert t.padding_free is False
+        assert t.balance_batch is False
         assert t.seed == 42
         assert t.max_steps == 200
 
