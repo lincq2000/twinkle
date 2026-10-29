@@ -60,6 +60,15 @@ logger = get_logger()
 CHECKPOINT_ADAPTER_NAME = 'default'
 
 
+def _no_sync_context(model, should_sync):
+    partition_gradients = getattr(model, "zero_optimization_partition_gradients", None)
+    if callable(partition_gradients) and partition_gradients():
+        return contextlib.nullcontext()  # ZeRO-2/3 does not support no_sync.
+    if not should_sync and hasattr(model, "no_sync"):
+        return model.no_sync()
+    return contextlib.nullcontext()
+
+
 def _get_vocab_size(config: PretrainedConfig) -> int:
     """Resolve the LM vocabulary size without running a sharded model forward."""
     vocab_size = getattr(config, 'vocab_size', None)
@@ -1390,9 +1399,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
             optimizer_config.cur_step += 1
         should_sync = (optimizer_config.do_grad_sync(kwargs.get('gradient_accumulation_steps'))
                        if sync_gradients is None else bool(sync_gradients))
-        no_sync_ctx = contextlib.nullcontext()
-        if not should_sync and hasattr(self.model, 'no_sync'):
-            no_sync_ctx = self.model.no_sync()
+        no_sync_ctx = _no_sync_context(self.model, should_sync)
 
         router_replay_mode = kwargs.pop('router_replay_mode', None)
         rr = None
@@ -1491,28 +1498,30 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         increment_step,
         **kwargs,
     ):
-        outputs = self.forward(
-            inputs=inputs,
-            loss_key=loss_key,
-            router_replay_manual_cleanup=True,
-            **kwargs,
-        )
-        previous_normalizer = optimizer_config.train_status.num_tokens
-        loss = self.calculate_loss(
-            loss_key=loss_key,
-            loss_weight=loss_weight,
-            global_normalizer=global_normalizer,
-            **kwargs,
-        )
-        normalizer_delta = optimizer_config.train_status.num_tokens - previous_normalizer
-        optimizer_config.train_status.loss_value = optimizer_config.train_status.loss_value * loss_scale
-        optimizer_config.train_status.num_tokens = previous_normalizer + normalizer_delta * loss_scale
-        outputs['loss'] = loss * loss_scale
-        self.backward(
-            increment_step=increment_step,
-            sync_gradients=sync_gradients,
-            **kwargs,
-        )
+        # DDP must see no_sync during the forward as well as the backward.
+        with _no_sync_context(getattr(self, "model", None), sync_gradients is not False):
+            outputs = self.forward(
+                inputs=inputs,
+                loss_key=loss_key,
+                router_replay_manual_cleanup=True,
+                **kwargs,
+            )
+            previous_normalizer = optimizer_config.train_status.num_tokens
+            loss = self.calculate_loss(
+                loss_key=loss_key,
+                loss_weight=loss_weight,
+                global_normalizer=global_normalizer,
+                **kwargs,
+            )
+            normalizer_delta = optimizer_config.train_status.num_tokens - previous_normalizer
+            optimizer_config.train_status.loss_value = optimizer_config.train_status.loss_value * loss_scale
+            optimizer_config.train_status.num_tokens = previous_normalizer + normalizer_delta * loss_scale
+            outputs['loss'] = loss * loss_scale
+            self.backward(
+                increment_step=increment_step,
+                sync_gradients=sync_gradients,
+                **kwargs,
+            )
         return outputs
 
     def _forward_backward_micro_batches(
@@ -1534,7 +1543,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         total_loss = 0.0
         outputs = {}
         for micro_batch_index, indices in enumerate(plan):
-            micro_kwargs = {key: select_batch(value, indices, local_batch_size) for key, value in kwargs.items()}
+            micro_kwargs = loss_instance.micro_batch_kwargs(kwargs, indices, local_batch_size)
             micro_loss_scale = loss_instance.micro_batch_scale(inputs, indices)
             is_last_micro_batch = micro_batch_index == len(plan) - 1
             outputs = self._forward_backward_micro_batch(

@@ -343,29 +343,6 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin, DeltaTrain
             return next(iter(self.optimizer_group))
         return self.active_group
 
-    @staticmethod
-    def _slice_value_for_microbatch(value, mb_start: int, mb_end: int, micro_batch_size: int):
-        """Recursively slice a value for microbatch processing.
-
-        Handles nested dicts (e.g. ref_outputs: {"logps": tensor}) by recursively slicing
-        internal tensors; scalars and non-sliceable values pass through as-is.
-        """
-        if isinstance(value, torch.Tensor) and value.dim() >= 1 and value.shape[0] > micro_batch_size:
-            return value[mb_start:mb_end]
-        elif isinstance(value, np.ndarray) and value.ndim >= 1 and value.shape[0] > micro_batch_size:
-            return value[mb_start:mb_end]
-        elif isinstance(value, (list, tuple)) and len(value) > micro_batch_size:
-            return value[mb_start:mb_end]
-        elif isinstance(value, dict):
-            # Recursively slice dict values (e.g., ref_outputs: {"logps": tensor})
-            return {
-                k: MegatronModel._slice_value_for_microbatch(v, mb_start, mb_end, micro_batch_size)
-                for k, v in value.items()
-            }
-        else:
-            # Scalars, small tensors, or non-sliceable values pass through as-is
-            return value
-
     @remote_function()
     def forward(self, *, inputs: Union[InputFeature, List[InputFeature], Trajectory, List[Trajectory]], **kwargs):
         raise NotImplementedError('Megatron only supports `forward_backward` and `forward_only`')
@@ -511,6 +488,7 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin, DeltaTrain
             inputs = optimizer_config.template.batch_encode(inputs)  # noqa
         if isinstance(inputs, dict):
             inputs = [inputs]
+        local_batch_size = len(inputs)
         local_batch_normalizer = loss_instance.batch_normalizer(inputs) if transactional else None
         processor: InputProcessor = optimizer_config.processor
         assert isinstance(processor, InputProcessor), 'Set InputProcessor correctly before forwarding'
@@ -573,10 +551,8 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin, DeltaTrain
             for mb_idx in range(num_microbatches):
                 mb_start = mb_idx * micro_batch_size
                 mb_end = mb_start + micro_batch_size
-                mb_kwargs = {
-                    key: self._slice_value_for_microbatch(value, mb_start, mb_end, micro_batch_size)
-                    for key, value in kwargs.items()
-                }
+                indices = list(range(mb_start, min(mb_end, local_batch_size)))
+                mb_kwargs = loss_instance.micro_batch_kwargs(kwargs, indices, local_batch_size)
                 loss_extra_kwargs_per_mb.append(mb_kwargs)
 
         _mb_counter = [0]  # mutable counter for closure
