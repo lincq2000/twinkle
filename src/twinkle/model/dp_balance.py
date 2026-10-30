@@ -165,14 +165,14 @@ def plan_dp_balance_for_lengths(
     identity = list(range(total))
     if dp_size == 1 or group_count < dp_size:
         return DPBalancePlan(order=identity)
+    if total % dp_size:
+        # Uneven rank sizes give samples rank-dependent loss weights; see the module docstring.
+        return DPBalancePlan(order=identity)
     if group_size > 1 and group_count % dp_size:
         raise ValueError(
             f"keeping groups of {group_size} together needs the group count ({group_count}) "
             f"to be divisible by dp_size={dp_size}"
         )
-    if total % dp_size:
-        # Uneven rank sizes give samples rank-dependent loss weights; see the module docstring.
-        return DPBalancePlan(order=identity)
     sample_workloads = [workload_fn(length) for length in lengths]
     if min(sample_workloads) < 0:
         raise ValueError(f"workload_fn must return non-negative values, got {min(sample_workloads)}")

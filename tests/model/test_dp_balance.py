@@ -124,6 +124,13 @@ def test_uneven_batch_keeps_its_order():
     assert plan.metrics == {}
 
 
+def test_uneven_grouped_batch_keeps_its_order():
+    plan = plan_dp_balance_for_lengths([900, 900, 100, 100] * 2 + [500, 500], 4, padding_free=True, group_size=2)
+
+    assert plan.order == list(range(10))
+    assert plan.metrics == {}
+
+
 def test_unplannable_batch_is_left_for_the_model_to_reject():
     config = MicroBatchConfig(micro_batch_size=2, dynamic_batching=True, max_tokens_per_micro_batch=50)
 
