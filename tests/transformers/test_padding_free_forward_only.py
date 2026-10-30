@@ -48,3 +48,17 @@ def test_forward_only_keeps_padding_free_samples_apart():
         packed = model.forward_only(inputs=[first, second])["logps"]
         alone = model.forward_only(inputs=[second])["logps"]
     torch.testing.assert_close(packed[1], alone[0])
+
+def test_forward_keeps_padding_free_samples_apart_without_checkpointing():
+    """Without gradient checkpointing the training forward must not build a KV cache either."""
+    model = TransformersModel(model_id=_tiny_qwen3_dir(), mixed_precision="no", gradient_checkpointing=False)
+    model.set_processor(InputProcessor, padding_free=True)
+    model._lazy_wrap_model()
+    model.model.train()
+    device = str(next(model.model.parameters()).device)
+    generator = torch.Generator().manual_seed(0)
+    first, second = _sample(12, generator), _sample(20, generator)
+    with patch("twinkle.processor.base.Platform.get_local_device", return_value=device):
+        packed = model.forward(inputs=[first, second])["logps"]
+        alone = model.forward(inputs=[second])["logps"]
+    torch.testing.assert_close(packed[1].detach(), alone[0].detach())
