@@ -24,7 +24,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
-from .micro_batch import MicroBatchConfig, _kk_partition, plan_micro_batches_for_lengths, sequence_length
+from .micro_batch import MicroBatchConfig, _batch_cost, _kk_partition, plan_micro_batches_for_lengths, sequence_length
 
 WorkloadFn = Callable[[int], int]
 
@@ -83,7 +83,7 @@ def _estimate_ranks(
         workloads.append(
             sum(micro_batch_workload(batch, padding_free=padding_free, workload_fn=workload_fn) for batch in batches)
         )
-        computed_tokens.append(sum(sum(batch) if padding_free else len(batch) * max(batch) for batch in batches))
+        computed_tokens.append(sum(_batch_cost(indices, lengths, padding_free) for indices in plan))
     return _RankEstimate(
         workloads=workloads,
         tokens=[sum(lengths) for lengths in rank_lengths],
@@ -152,7 +152,6 @@ def plan_dp_balance_for_lengths(
     micro_batch_config: MicroBatchConfig | None = None,
     group_size: int = 1,
     workload_fn: WorkloadFn = estimate_workload,
-    metric_prefix: str = "dp_balance",
 ) -> DPBalancePlan:
     """Same as :func:`plan_dp_balance`, for samples given by their sequence lengths."""
     lengths = [int(length) for length in lengths]
@@ -206,17 +205,17 @@ def plan_dp_balance_for_lengths(
     # Ties keep the earlier candidate, so the batch is only permuted when the slowest rank gets lighter.
     strategy = min(estimates, key=lambda name: (max(estimates[name][1].workloads), estimates[name][1].micro_batches))
     order, after = estimates[strategy]
-    metrics = {f"{metric_prefix}/rank_tokens_mean": sum(lengths) / dp_size}
+    metrics = {"dp_balance/rank_tokens_mean": sum(lengths) / dp_size}
     phases = [("after", after)]
     if "identity" in estimates:
         phases.insert(0, ("before", estimates["identity"][1]))
     for phase, estimate in phases:
-        metrics[f"{metric_prefix}/rank_tokens_max_{phase}"] = max(estimate.tokens)
-        metrics[f"{metric_prefix}/rank_tokens_min_{phase}"] = min(estimate.tokens)
-        metrics[f"{metric_prefix}/workload_imbalance_{phase}"] = _imbalance(estimate.workloads)
-        metrics[f"{metric_prefix}/micro_batches_{phase}"] = estimate.micro_batches
+        metrics[f"dp_balance/rank_tokens_max_{phase}"] = max(estimate.tokens)
+        metrics[f"dp_balance/rank_tokens_min_{phase}"] = min(estimate.tokens)
+        metrics[f"dp_balance/workload_imbalance_{phase}"] = _imbalance(estimate.workloads)
+        metrics[f"dp_balance/micro_batches_{phase}"] = estimate.micro_batches
         if not padding_free:
-            metrics[f"{metric_prefix}/padding_ratio_{phase}"] = 1 - sum(estimate.tokens) / sum(estimate.computed_tokens)
+            metrics[f"dp_balance/padding_ratio_{phase}"] = 1 - sum(estimate.tokens) / sum(estimate.computed_tokens)
     return DPBalancePlan(order=order, strategy=strategy, metrics=metrics)
 
 
@@ -228,7 +227,6 @@ def plan_dp_balance(
     micro_batch_config: MicroBatchConfig | None = None,
     group_size: int = 1,
     workload_fn: WorkloadFn = estimate_workload,
-    metric_prefix: str = "dp_balance",
 ) -> DPBalancePlan:
     """Plan a DP-balanced order for encoded ``inputs`` that will be dispatched with ``slice_dp``.
 
@@ -248,5 +246,4 @@ def plan_dp_balance(
         micro_batch_config=micro_batch_config,
         group_size=group_size,
         workload_fn=workload_fn,
-        metric_prefix=metric_prefix,
     )

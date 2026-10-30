@@ -1,3 +1,4 @@
+# Copyright (c) ModelScope Contributors. All rights reserved.
 import numpy as np
 
 from twinkle.template.contract import append_and_finalize

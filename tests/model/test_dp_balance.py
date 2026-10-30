@@ -10,7 +10,7 @@ from twinkle.model.dp_balance import (
     plan_dp_balance,
     plan_dp_balance_for_lengths,
 )
-from twinkle.model.micro_batch import MicroBatchConfig, _kk_partition, plan_micro_batches
+from twinkle.model.micro_batch import MicroBatchConfig, _kk_partition
 
 
 def _rank_chunks(values, dp_size):
@@ -89,14 +89,14 @@ def test_padded_dynamic_batching_prefers_ranks_with_similar_lengths():
 
 
 def test_dynamic_batching_estimate_uses_the_model_common_micro_batch_count():
+    # On its own rank 1 fits in one padded micro-batch costing 3 * 30; split into rank 0's three, it costs 50.
     config = MicroBatchConfig(micro_batch_size=4, dynamic_batching=True, max_tokens_per_micro_batch=100)
-    rank_lengths = [[90, 80, 70], [10, 10, 10]]
+    rank_lengths = [[90, 80, 70], [30, 10, 10]]
 
-    estimate = _estimate_ranks(rank_lengths, config, True, lambda n: n)
+    estimate = _estimate_ranks(rank_lengths, config, False, lambda n: n)
 
-    inputs = [{"input_ids": list(range(n))} for n in rank_lengths[1]]
     assert estimate.micro_batches == 3
-    assert len(plan_micro_batches(inputs, config, padding_free=True, min_micro_batches=3)) == 3
+    assert estimate.workloads == [240, 50]
 
 
 def test_balanced_batch_keeps_its_order():

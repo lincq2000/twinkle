@@ -81,8 +81,9 @@ class NPULinearAttentionKernel(Patch):
     """
 
     def __call__(self, module, *args, **kwargs):
-        from twinkle.kernel import KernelChoice, kernelize
-        kernelize(module, {'fla': KernelChoice(op='fla', backends=('npu', ))})
+        from twinkle.kernel import kernelize
+        from twinkle.kernel.config import DEFAULT_KERNEL_CONFIG
+        kernelize(module, {'fla': DEFAULT_KERNEL_CONFIG['fla']})
 
 
 def main():
