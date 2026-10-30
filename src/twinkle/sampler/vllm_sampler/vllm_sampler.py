@@ -78,7 +78,13 @@ def _load_vllm_image(entry: Any) -> Any:
 #: The actor's method-concurrency ceiling (Ray runs a decorated actor's methods one at a time
 #: unless this is raised). Shared with the server-side async backend, which decorates its own
 #: actor with the same ceiling, hence the public name.
-SAMPLER_MAX_CONCURRENCY = max(1, int(os.environ.get('TWINKLE_SAMPLER_MAX_CONCURRENCY') or 24))
+#: The default sizes to the in-flight generations a rollout driver keeps open (a hundred-plus
+#: episodes is normal), not to a small admission width: an in-flight ``sample`` holds one
+#: concurrency slot for the whole generation while doing nothing but waiting on a future, so a
+#: ceiling of 24 capped the engine at 24 concurrent requests -- measured as a 3.5x per-request
+#: slowdown on a 100-request rollout. An explicit TWINKLE_SAMPLER_MAX_CONCURRENCY wins outright.
+_ENV_SAMPLER_CONCURRENCY = os.environ.get('TWINKLE_SAMPLER_MAX_CONCURRENCY')
+SAMPLER_MAX_CONCURRENCY = max(1, int(_ENV_SAMPLER_CONCURRENCY)) if _ENV_SAMPLER_CONCURRENCY else 256
 
 
 @remote_class(max_concurrency=SAMPLER_MAX_CONCURRENCY)
@@ -784,7 +790,7 @@ class vLLMSampler(Sampler, CheckpointEngineMixin, PartialRolloutMixin, DeltaSamp
         from twinkle.server.sampler.backends import stream_to_queue
         stream_to_queue(self, queue, inputs, sampling_params, adapter_name, adapter_path)
 
-    @remote_function(dispatch='all', collect='first')
+    @remote_function(dispatch='all', collect='first', lazy_collect=False)
     @timed
     def sleep(self, level: int = 1) -> None:
         """
@@ -792,9 +798,18 @@ class vLLMSampler(Sampler, CheckpointEngineMixin, PartialRolloutMixin, DeltaSamp
         """
         self._run_in_loop(self.engine.sleep(level))
 
-    @remote_function(dispatch='all', collect='first')
+    @remote_function(dispatch='all', collect='first', lazy_collect=False)
     @timed
     def wake_up(self, tags: List[str] = None) -> None:
+        """Resume engine state (weights / kv cache) BEFORE the caller proceeds.
+
+        Eagerly collected by design: a lazy wake_up returns before the engine is
+        actually awake, and the next wave of ``sample`` calls then parks on the
+        continuous-work barrier waiting for that in-flight ref -- a wave whose
+        own execution the wake_up's completion can depend on, which is a closed
+        wait loop. Waiting here means the device is guaranteed awake (or the
+        failure is visible at this line) before generation starts.
+        """
         self._run_in_loop(self.engine.wake_up(tags=tags))
 
     @remote_function(dispatch='all', collect='first')
