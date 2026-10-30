@@ -60,6 +60,15 @@ logger = get_logger()
 CHECKPOINT_ADAPTER_NAME = 'default'
 
 
+def _no_sync_context(model, should_sync):
+    partition_gradients = getattr(model, "zero_optimization_partition_gradients", None)
+    if callable(partition_gradients) and partition_gradients():
+        return contextlib.nullcontext()  # ZeRO-2/3 does not support no_sync.
+    if not should_sync and hasattr(model, "no_sync"):
+        return model.no_sync()
+    return contextlib.nullcontext()
+
+
 def _get_vocab_size(config: PretrainedConfig) -> int:
     """Resolve the LM vocabulary size without running a sharded model forward."""
     vocab_size = getattr(config, 'vocab_size', None)
@@ -111,11 +120,11 @@ def _resolve_task_context(model, task, template=None):
     'causal_lm' (default) keeps the model untouched (returns ``nullcontext``).
     'embedding' swaps lm_head for identity + installs a feature-extraction hook so
     downstream pooling can run inside
-    ``InputProcessor.postprocess_tensor_sp(task='embedding', ...)``.
+    ``InputProcessor.postprocess_outputs(task='embedding', ...)``.
     'generative_reranker' wraps lm_head to emit a per-token yes-minus-no score; the
-    last-valid-token reduction is deferred to ``postprocess_tensor_sp`` too.
+    last-valid-token reduction is deferred to ``postprocess_outputs`` too.
     'seq_cls' / 'reranker' capture per-token scores BEFORE HF's internal pooling so
-    ``postprocess_tensor_sp`` can do packed-aware last-token reduction (same as embedding).
+    ``postprocess_outputs`` can do packed-aware last-token reduction (same as embedding).
     """
     if task in (None, 'causal_lm'):
         return contextlib.nullcontext()
@@ -870,7 +879,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
                 del logits
         if getattr(loss_instance, 'require_values', False):
             values = outputs['logits']
-            outputs['values'] = values.squeeze(-1) if values.shape[-1] == 1 else values
+            outputs['values'] = values.squeeze(-1) if values.dim() == 3 and values.shape[-1] == 1 else values
         outputs['past_key_values'] = None
         if not (return_logits or loss_require_logits):
             outputs['logits'] = None
@@ -878,8 +887,10 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
     def _finalize_forward_outputs(self, inputs, outputs, *, processor, task, optimizer_config, is_training,
                                   forward_kwargs, loss_instance, return_logits, recorded_routing):
         """Shared forward/forward_only tail: SP postprocess, unpack, status recording, and the return copy."""
-        inputs, outputs = processor.postprocess_tensor_sp(inputs, outputs, sp_strategy=self.sp_strategy, task=task)
-        inputs, outputs = processor.unpack_packed_sequences(inputs, outputs, task=task)
+        inputs, outputs = processor.postprocess_outputs(
+            inputs, outputs, task=task,
+            gather_fn=self.sp_strategy.gather_loss_tensors if self.sp_strategy is not None else None,
+            reduce_fn=self.sp_strategy.all_reduce if self.sp_strategy is not None else None)
         status = optimizer_config.train_status if is_training else optimizer_config.eval_status
         status.inputs = inputs
         status.outputs = outputs
@@ -936,11 +947,14 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         assert isinstance(processor, InputProcessor), 'Set a correct `InputProcessor` before forwarding'
         inputs: Dict[str, Any] = processor(
             inputs,
-            sp_strategy=self.sp_strategy,
             hf_config=self.hf_config,
             enable_sp=getattr(self, '_enable_sp', False),
             gdn_padding_free_enabled=self._gdn_padding_free_enabled,
         )
+        if self.sp_strategy is not None:
+            inputs = self.sp_strategy.prepare_model_inputs(
+                inputs, token_labels=processor.token_level_labels(task), padding_free=processor.padding_free)
+        sequence_layout = inputs.pop('_sequence_layout', None)
         labels: torch.Tensor = inputs.pop('labels', None)
         loss_scale = inputs.pop('loss_scale', None)
         channel = inputs.pop('channel', None)
@@ -979,11 +993,14 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         unwrapped_model = self.strategy.unwrap_model(self.model)
         with _resolve_task_context(unwrapped_model, task, template=optimizer_config.template), \
                 _resolve_mm_graph_context(unwrapped_model, optimizer_config.template):
-            outputs = self.model(**inputs)
+            with self.sp_strategy.context() if self.sp_strategy is not None else contextlib.nullcontext():
+                outputs = self.model(**inputs)
 
         recorded_routing = rr.finish()
 
         self._restore_loss_inputs(inputs, labels, loss_scale, channel, completion_mask)
+        if sequence_layout is not None:
+            inputs['_sequence_layout'] = sequence_layout
         self._postprocess_forward_outputs(
             outputs,
             labels=labels,
@@ -1103,11 +1120,14 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
                     raise ValueError('sampling replay does not support sequence or context parallelism')
             inputs: Dict[str, Any] = processor(
                 inputs,
-                sp_strategy=self.sp_strategy,
                 hf_config=self.hf_config,
                 enable_sp=getattr(self, '_enable_sp', False),
                 gdn_padding_free_enabled=self._gdn_padding_free_enabled,
             )
+            if self.sp_strategy is not None:
+                inputs = self.sp_strategy.prepare_model_inputs(
+                    inputs, token_labels=processor.token_level_labels(task), padding_free=processor.padding_free)
+            sequence_layout = inputs.pop('_sequence_layout', None)
             labels = inputs.pop('labels', None)
             loss_scale = inputs.pop('loss_scale', None)
             channel = inputs.pop('channel', None)
@@ -1145,11 +1165,14 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
                 if disable_lora and isinstance(unwrapped_model, PeftModel) else contextlib.nullcontext())
             # unwrapped on purpose: task patches probe head/module attributes DDP does not forward.
             with _resolve_task_context(unwrapped_model, task, template=optimizer_config.template), lora_ctx:
-                outputs = self.model(**inputs)
+                with self.sp_strategy.context() if self.sp_strategy is not None else contextlib.nullcontext():
+                    outputs = self.model(**inputs)
 
             recorded_routing = rr.finish()
 
             self._restore_loss_inputs(inputs, labels, loss_scale, channel, completion_mask)
+            if sequence_layout is not None:
+                inputs['_sequence_layout'] = sequence_layout
             self._postprocess_forward_outputs(
                 outputs,
                 labels=labels,
@@ -1376,9 +1399,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
             optimizer_config.cur_step += 1
         should_sync = (optimizer_config.do_grad_sync(kwargs.get('gradient_accumulation_steps'))
                        if sync_gradients is None else bool(sync_gradients))
-        no_sync_ctx = contextlib.nullcontext()
-        if not should_sync and hasattr(self.model, 'no_sync'):
-            no_sync_ctx = self.model.no_sync()
+        no_sync_ctx = _no_sync_context(self.model, should_sync)
 
         router_replay_mode = kwargs.pop('router_replay_mode', None)
         rr = None
@@ -1477,28 +1498,30 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         increment_step,
         **kwargs,
     ):
-        outputs = self.forward(
-            inputs=inputs,
-            loss_key=loss_key,
-            router_replay_manual_cleanup=True,
-            **kwargs,
-        )
-        previous_normalizer = optimizer_config.train_status.num_tokens
-        loss = self.calculate_loss(
-            loss_key=loss_key,
-            loss_weight=loss_weight,
-            global_normalizer=global_normalizer,
-            **kwargs,
-        )
-        normalizer_delta = optimizer_config.train_status.num_tokens - previous_normalizer
-        optimizer_config.train_status.loss_value = optimizer_config.train_status.loss_value * loss_scale
-        optimizer_config.train_status.num_tokens = previous_normalizer + normalizer_delta * loss_scale
-        outputs['loss'] = loss * loss_scale
-        self.backward(
-            increment_step=increment_step,
-            sync_gradients=sync_gradients,
-            **kwargs,
-        )
+        # DDP must see no_sync during the forward as well as the backward.
+        with _no_sync_context(getattr(self, "model", None), sync_gradients is not False):
+            outputs = self.forward(
+                inputs=inputs,
+                loss_key=loss_key,
+                router_replay_manual_cleanup=True,
+                **kwargs,
+            )
+            previous_normalizer = optimizer_config.train_status.num_tokens
+            loss = self.calculate_loss(
+                loss_key=loss_key,
+                loss_weight=loss_weight,
+                global_normalizer=global_normalizer,
+                **kwargs,
+            )
+            normalizer_delta = optimizer_config.train_status.num_tokens - previous_normalizer
+            optimizer_config.train_status.loss_value = optimizer_config.train_status.loss_value * loss_scale
+            optimizer_config.train_status.num_tokens = previous_normalizer + normalizer_delta * loss_scale
+            outputs['loss'] = loss * loss_scale
+            self.backward(
+                increment_step=increment_step,
+                sync_gradients=sync_gradients,
+                **kwargs,
+            )
         return outputs
 
     def _forward_backward_micro_batches(
@@ -1520,7 +1543,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         total_loss = 0.0
         outputs = {}
         for micro_batch_index, indices in enumerate(plan):
-            micro_kwargs = {key: select_batch(value, indices, local_batch_size) for key, value in kwargs.items()}
+            micro_kwargs = loss_instance.micro_batch_kwargs(kwargs, indices, local_batch_size)
             micro_loss_scale = loss_instance.micro_batch_scale(inputs, indices)
             is_last_micro_batch = micro_batch_index == len(plan) - 1
             outputs = self._forward_backward_micro_batch(
@@ -2104,9 +2127,11 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
                         save_file(contiguous_dict, os.path.join(checkpoint_dir, 'adapter_model.safetensors'))
                     else:
                         torch.save(contiguous_dict, os.path.join(checkpoint_dir, 'adapter_model.bin'))
-            else:
+            elif Platform.is_master():
+                # Transformers' is_main_process only guards metadata/cleanup, not weight
+                # shard writes. Gather state on every rank above, but write it only once.
                 model.save_pretrained(
-                    checkpoint_dir, state_dict=processed_state_dict, is_main_process=Platform.is_master(),
+                    checkpoint_dir, state_dict=processed_state_dict, is_main_process=True,
                     **save_kwargs)
 
         if async_save:

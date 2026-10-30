@@ -18,6 +18,12 @@ class Loss:
         raise NotImplementedError(
             f'{self.__class__.__name__} does not support micro-batching, including dynamic batching')
 
+    def micro_batch_kwargs(self, kwargs, indices, batch_size):
+        """Keep sample-aligned loss inputs in the same order as the selected model inputs."""
+        from twinkle.model.micro_batch import select_batch
+
+        return {key: select_batch(value, indices, batch_size) for key, value in kwargs.items()}
+
     def batch_normalizer(self, inputs: list[InputFeature]):
         """Return this batch's additive reduction denominator, or ``None`` for mean-reduced losses."""
         return None

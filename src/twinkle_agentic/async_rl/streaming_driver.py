@@ -797,16 +797,16 @@ class StreamingDriver:
             if group_counts is not None:
                 group_counts.pop(record.group_key, None)
         steps = self._consume_batch(records)
-        steps = int(steps) if steps else 1
+        steps = 1 if steps is None else int(steps)
         self._last_pull_steps = steps
+        current = self._current_version()
         if steps > 0:
-            current = self._current_version()
             self.stats.train_pulls += 1
-            self.stats.optimizer_steps += steps
-            for record in records:
-                self.stats.consumed += 1
-                if current - record.version > 0:
-                    self.stats.off_policy_consumed += 1
+        self.stats.optimizer_steps += steps
+        for record in records:
+            self.stats.consumed += 1
+            if current - record.version > 0:
+                self.stats.off_policy_consumed += 1
 
     def _register_initial_policy(self) -> None:
         """Pin the version-0 policy so the first admissions reference a real version, never an unpinned base.
@@ -1158,11 +1158,13 @@ class StreamingDriver:
 
         The recipe calls this after training the batch ``__next__`` handed it. The count becomes the
         bridge's consume return, which drives the publish cadence (twinkle publishes after consume returns,
-        so the trained weights -- not stale ones -- are what the next admission window samples from). A falsy
-        count is treated as one step, matching :meth:`_train_pull`. The same count also feeds the internal
+        so the trained weights -- not stale ones -- are what the next admission window samples from). A zero
+        count reports no optimizer update. The same count also feeds the internal
         ``max_steps`` budget, so a driver constructed with a numeric budget exits on its own.
         """
-        self._committed_steps = int(optimizer_steps) if optimizer_steps else 1
+        if optimizer_steps < 0:
+            raise ValueError('optimizer_steps must be non-negative')
+        self._committed_steps = int(optimizer_steps)
         self._budget_steps += self._committed_steps
         self._ack_event.set()
 

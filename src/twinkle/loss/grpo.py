@@ -867,6 +867,17 @@ class BNPOLoss(GRPOLoss):
         # token 和当均值直接平均，展示出一个被 token 数放大的巨大 loss（梯度不受影响，纯展示失真）。
         self.reduction = 'sum' if token_mean_scope == 'global' else 'mean'
 
+    def batch_normalizer(self, inputs):
+        if self.token_mean_scope != "global":
+            return None
+        import torch
+
+        total = 0
+        for model_input in inputs:
+            labels = torch.as_tensor(model_input["labels"]).reshape(1, -1)
+            total += int(self._resolve_loss_mask(model_input, labels).sum().item())
+        return total
+
     def micro_batch_scale(self, inputs, indices):
         """The weight one micro-batch carries, which has to follow ``token_mean_scope``.
 
