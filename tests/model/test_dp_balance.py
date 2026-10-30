@@ -115,13 +115,13 @@ def test_groups_stay_on_one_rank():
     assert all(first % 2 == 0 and second == first + 1 for first, second in pairs)
 
 
-def test_uneven_batch_follows_get_slice_sizes():
-    lengths = [100, 900, 100, 900, 500]
+def test_uneven_batch_keeps_its_order():
+    # get_slice gives rank 0 three samples and rank 1 two, so a sample's loss weight depends on its rank.
+    plan = plan_dp_balance_for_lengths([900, 900, 900, 100, 100], 2, padding_free=True)
 
-    plan = plan_dp_balance_for_lengths(lengths, 2, padding_free=True)
-
-    assert sorted(plan.order) == list(range(5))
-    assert plan.metrics["dp_balance/workload_imbalance_after"] <= plan.metrics["dp_balance/workload_imbalance_before"]
+    assert plan.order == [0, 1, 2, 3, 4]
+    assert plan.strategy == "identity"
+    assert plan.metrics == {}
 
 
 def test_unplannable_batch_is_left_for_the_model_to_reject():

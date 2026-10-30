@@ -5,6 +5,10 @@
 slowest rank. ``plan_dp_balance`` permutes the batch so the chunks cost about the same, without changing how
 many samples each rank receives.
 
+Only batches that split evenly across the ranks are permuted. Losses such as ``GRPOLoss`` average over the
+samples of one rank and DP then averages the ranks, so a sample weighs ``1 / (dp_size * rank_size)``; when
+``get_slice`` gives some ranks one sample more, moving samples between ranks would change their weights.
+
 A rank's cost is estimated by running the same micro-batch planner the model runs on its chunk, so the
 estimate follows both the micro-batch layout and the input layout:
 
@@ -88,28 +92,13 @@ def _estimate_ranks(
     )
 
 
-def _rank_sizes(total: int, dp_size: int) -> list[int]:
-    # Mirrors DeviceMesh.get_slice: the first ``total % dp_size`` ranks get one extra item.
-    base, remainder = divmod(total, dp_size)
-    return [base + int(rank < remainder) for rank in range(dp_size)]
-
-
 def _contiguous(group_count: int, dp_size: int) -> list[list[int]]:
-    ranks, start = [], 0
-    for size in _rank_sizes(group_count, dp_size):
-        ranks.append(list(range(start, start + size)))
-        start += size
-    return ranks
+    size = group_count // dp_size
+    return [list(range(rank * size, (rank + 1) * size)) for rank in range(dp_size)]
 
 
 def _karmarkar_karp(group_workloads: list[int], dp_size: int) -> list[list[int]]:
-    # Zero-cost placeholders round the batch up to equal-size partitions. They take the lowest indices, so
-    # they all land in the first KK seed, hence at most one per rank.
-    placeholders = -len(group_workloads) % dp_size
-    partitions = _kk_partition([0] * placeholders + group_workloads, dp_size, equal_size=True)
-    ranks = [sorted(index - placeholders for index in part if index >= placeholders) for part in partitions]
-    # Ranks without a placeholder hold one more group; get_slice puts the larger chunks first.
-    return sorted(ranks, key=len, reverse=True)
+    return [sorted(part) for part in _kk_partition(group_workloads, dp_size, equal_size=True)]
 
 
 def _snake(group_keys: list[tuple[int, int]], dp_size: int) -> list[list[int]]:
@@ -122,8 +111,8 @@ def _snake(group_keys: list[tuple[int, int]], dp_size: int) -> list[list[int]]:
     ranks: list[list[int]] = [[] for _ in range(dp_size)]
     for start in range(0, len(ordered), dp_size):
         chunk = ordered[start : start + dp_size]
-        targets = range(dp_size) if (start // dp_size) % 2 == 0 or len(chunk) < dp_size else range(dp_size - 1, -1, -1)
-        for rank, group in zip(targets, chunk, strict=False):
+        targets = range(dp_size) if (start // dp_size) % 2 == 0 else range(dp_size - 1, -1, -1)
+        for rank, group in zip(targets, chunk, strict=True):
             ranks[rank].append(group)
     return [sorted(groups) for groups in ranks]
 
@@ -181,6 +170,9 @@ def plan_dp_balance_for_lengths(
             f"keeping groups of {group_size} together needs the group count ({group_count}) "
             f"to be divisible by dp_size={dp_size}"
         )
+    if total % dp_size:
+        # Uneven rank sizes give samples rank-dependent loss weights; see the module docstring.
+        return DPBalancePlan(order=identity)
     sample_workloads = [workload_fn(length) for length in lengths]
     if min(sample_workloads) < 0:
         raise ValueError(f"workload_fn must return non-negative values, got {min(sample_workloads)}")
@@ -199,10 +191,10 @@ def plan_dp_balance_for_lengths(
     estimates: dict[str, tuple[list[int], _RankEstimate]] = {}
     for name, rank_groups in candidates.items():
         order = [index for groups in rank_groups for group in groups for index in members(group)]
-        rank_lengths, start = [], 0
-        for size in _rank_sizes(total, dp_size):
-            rank_lengths.append([lengths[index] for index in order[start : start + size]])
-            start += size
+        rank_size = total // dp_size
+        rank_lengths = [
+            [lengths[index] for index in order[rank * rank_size : (rank + 1) * rank_size]] for rank in range(dp_size)
+        ]
         try:
             estimates[name] = order, _estimate_ranks(rank_lengths, micro_batch_config, padding_free, workload_fn)
         except ValueError:
@@ -247,6 +239,7 @@ def plan_dp_balance(
 
     Every rank keeps the sample count ``get_slice`` gives it, and ``group_size`` consecutive samples stay on
     one rank (for example chosen/rejected pairs). Within a rank, samples keep their original relative order.
+    A batch whose size is not a multiple of ``dp_size`` keeps its order (see the module docstring).
     """
     return plan_dp_balance_for_lengths(
         [sequence_length(model_input) for model_input in inputs],
